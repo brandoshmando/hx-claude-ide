@@ -12,6 +12,11 @@
 // method; it has to be in scope even though we never name it directly.
 use steel::steel_vm::ffi::{FFIModule, RegisterFFIFn};
 
+// The lock-file writer. Its public items are used starting in T08 (the FFI
+// `start()` wiring), so allow dead_code until then to keep the build warning-free.
+#[allow(dead_code)]
+mod lockfile;
+
 /// Steel entrypoint: `(claude-ide/start)`.
 ///
 /// Stub for now. In T08 this binds a 127.0.0.1 WebSocket port, writes the

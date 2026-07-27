@@ -1,0 +1,20 @@
+[package]
+name = "hx-claude-ide"
+edition = "2021"
+version = "0.1.0"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "claude_ide"
+# cdylib = a C-ABI dynamic library (.dylib/.so/.dll). This is what Steel's forge
+# loads at runtime; the file it produces is `libclaude_ide.<ext>`.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned to the exact steel rev Helix (hx-steel) is built from, so our dylib is
+# ABI-compatible with the host. The crate is `steel-core` but its lib is named
+# `steel`, so in code we write `use steel::...`.
+steel-core = { git = "https://github.com/mattwparas/steel.git", rev = "3a418c9", features = ["dylibs"] }
+# Provides the stable-ABI plumbing the `declare_module!` macro relies on.
+abi_stable = "0.11.1"

@@ -6,16 +6,17 @@
 //! Helix. Each accepted client gets its own thread and an outgoing channel so the
 //! selection emitter (T07) can broadcast to every client.
 //!
-//! T05 scope: bind + accept + auth. Handling `initialize`/`tools/list` is T06;
-//! broadcasting `selection_changed` is T07.
+//! Layering: bind + accept + auth (T05); the `initialize`/`tools/list` handshake
+//! (T06, in the `mcp` module); `selection_changed` debounce + broadcast (T07).
 
 use std::net::{TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use serde_json::json;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::Message;
 
@@ -28,16 +29,34 @@ const AUTH_HEADER: &str = "x-claude-code-ide-authorization";
 /// hot spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Trailing-debounce window for selection updates: after the last payload
+/// arrives, wait this long for a quieter moment before broadcasting, so a burst
+/// of cursor moves collapses into a single notification (design D5).
+const DEBOUNCE: Duration = Duration::from_millis(50);
+
 /// One outgoing-message channel per connected client. The emitter clones a
 /// `Message` onto every `Sender` to broadcast; a `Sender` whose receiver has
 /// hung up (client gone) errors on send, which is how dead clients get pruned.
 type Clients = Arc<Mutex<Vec<Sender<Message>>>>;
 
+/// A snapshot of the editor's current selection, handed from the Steel-facing
+/// `push_selection` (T08) to the emitter. Coordinates are already 0-indexed
+/// (the Steel layer converts) — Rust only assembles and serializes (F3).
+pub struct SelectionPayload {
+    pub file: String,
+    pub text: String,
+    pub start_line: i64,
+    pub start_col: i64,
+    pub end_line: i64,
+    pub end_col: i64,
+    pub is_empty: bool,
+}
+
 /// Handle to the running server. Holds the bound `port` (which the lock file
-/// advertises) and the shared client registry (used by the emitter in T07).
+/// advertises) and the channel the Steel layer pushes selection updates into.
 pub struct Server {
     pub port: u16,
-    clients: Clients,
+    selection_tx: Sender<SelectionPayload>,
 }
 
 impl Server {
@@ -51,10 +70,21 @@ impl Server {
 
         let clients: Clients = Arc::new(Mutex::new(Vec::new()));
 
+        // The emitter thread owns the receiving end of the selection channel and
+        // its own handle to the client list; it debounces and broadcasts.
+        let (selection_tx, selection_rx) = mpsc::channel::<SelectionPayload>();
+        let emitter_clients = Arc::clone(&clients);
+        thread::spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                emitter_loop(selection_rx, emitter_clients);
+            }));
+        });
+
         // `Arc` = atomically reference-counted shared ownership. The token and
         // client list are shared between the accept thread (and every connection
-        // thread it spawns) and the `Server` we return. Cloning an `Arc` bumps a
-        // counter and hands out another handle to the *same* value.
+        // thread it spawns) and the emitter. Cloning an `Arc` bumps a counter and
+        // hands out another handle to the *same* value. Note `clients` isn't
+        // stored on `Server`: the two threads' clones keep the `Vec` alive.
         let token = Arc::new(token);
         let accept_clients = Arc::clone(&clients);
 
@@ -65,14 +95,66 @@ impl Server {
             // a panic in a spawned thread already stays within that thread; this
             // is belt-and-suspenders. The hard rule — never unwind across the FFI
             // boundary — is enforced in the `start()`/`push_selection()` fns (T08),
-            // which don't call into this thread synchronously.
+            // which don't call into these threads synchronously.
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 accept_loop(listener, token, accept_clients);
             }));
         });
 
-        Ok(Server { port, clients })
+        Ok(Server { port, selection_tx })
     }
+
+    /// Hand a selection snapshot to the emitter. Called from the FFI
+    /// `push_selection` (T08). Sending never blocks; if the emitter thread is
+    /// gone we silently drop the update (nothing useful to do from the editor).
+    pub fn push_selection(&self, payload: SelectionPayload) {
+        let _ = self.selection_tx.send(payload);
+    }
+}
+
+/// Receives selection payloads, debounces bursts, and broadcasts the latest as a
+/// `selection_changed` notification to every connected client.
+fn emitter_loop(rx: Receiver<SelectionPayload>, clients: Clients) {
+    // Block for the first payload of a burst.
+    while let Ok(mut latest) = rx.recv() {
+        // Coalesce: keep replacing `latest` with any newer payload that arrives
+        // within the debounce window. When the window passes quietly, emit.
+        loop {
+            match rx.recv_timeout(DEBOUNCE) {
+                Ok(newer) => latest = newer,               // supersede, keep waiting
+                Err(RecvTimeoutError::Timeout) => break,   // quiet → emit `latest`
+                Err(RecvTimeoutError::Disconnected) => return, // all senders gone
+            }
+        }
+        broadcast(&clients, selection_notification(&latest));
+    }
+}
+
+/// Sends `message` to every client, dropping any whose receiver has hung up.
+fn broadcast(clients: &Clients, message: Message) {
+    let mut guard = clients.lock().unwrap();
+    // `retain` keeps only the entries whose closure returns true. A failed
+    // `send` means that client's connection thread is gone → prune it.
+    guard.retain(|tx| tx.send(message.clone()).is_ok());
+}
+
+/// Builds the F2 `selection_changed` JSON-RPC notification for a payload.
+fn selection_notification(p: &SelectionPayload) -> Message {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method": "selection_changed",
+        "params": {
+            "text": p.text,
+            "filePath": p.file,
+            "fileUrl": format!("file://{}", p.file),
+            "selection": {
+                "start": { "line": p.start_line, "character": p.start_col },
+                "end": { "line": p.end_line, "character": p.end_col },
+                "isEmpty": p.is_empty,
+            }
+        }
+    });
+    Message::text(body.to_string())
 }
 
 /// Blocks accepting connections; hands each off to its own thread.
@@ -205,6 +287,79 @@ mod tests {
         assert_eq!(v["id"], 1);
         assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(v["result"]["serverInfo"]["name"], "Helix");
+    }
+
+    fn sample_payload(text: &str) -> SelectionPayload {
+        SelectionPayload {
+            file: "/tmp/example.rs".to_string(),
+            text: text.to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 4,
+            is_empty: text.is_empty(),
+        }
+    }
+
+    #[test]
+    fn notification_has_f2_shape() {
+        let payload = SelectionPayload {
+            file: "/a/b.rs".to_string(),
+            text: "hi".to_string(),
+            start_line: 10,
+            start_col: 5,
+            end_line: 12,
+            end_col: 3,
+            is_empty: false,
+        };
+        let msg = selection_notification(&payload);
+        let v: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "selection_changed");
+        assert!(v.get("id").is_none(), "notifications carry no id");
+        assert_eq!(v["params"]["text"], "hi");
+        assert_eq!(v["params"]["filePath"], "/a/b.rs");
+        assert_eq!(v["params"]["fileUrl"], "file:///a/b.rs");
+        assert_eq!(v["params"]["selection"]["start"]["line"], 10);
+        assert_eq!(v["params"]["selection"]["start"]["character"], 5);
+        assert_eq!(v["params"]["selection"]["end"]["line"], 12);
+        assert_eq!(v["params"]["selection"]["end"]["character"], 3);
+        assert_eq!(v["params"]["selection"]["isEmpty"], false);
+    }
+
+    #[test]
+    fn debounces_burst_and_broadcasts_selection_changed() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let server = Server::start(token.to_string()).expect("server should start");
+
+        // Connect via a raw TcpStream so we can set a read timeout — the test
+        // fails fast instead of hanging if no notification ever arrives.
+        let addr = format!("127.0.0.1:{}", server.port);
+        let stream = std::net::TcpStream::connect(&addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut request = format!("ws://{addr}/").into_client_request().unwrap();
+        request.headers_mut().insert(AUTH_HEADER, token.parse().unwrap());
+        let (mut ws, _resp) = tungstenite::client(request, stream).expect("handshake");
+
+        // Ensure the server has registered this client before we push.
+        thread::sleep(Duration::from_millis(150));
+
+        // A burst of three within the debounce window collapses to one broadcast,
+        // carrying the latest payload.
+        for text in ["first", "second", "final"] {
+            server.push_selection(sample_payload(text));
+        }
+        let msg = ws.read().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(msg.as_str()).unwrap();
+        assert_eq!(v["method"], "selection_changed");
+        assert_eq!(v["params"]["text"], "final", "burst should collapse to the latest");
+
+        // A separate, later update emits its own notification.
+        server.push_selection(sample_payload("later"));
+        let msg2 = ws.read().unwrap().into_text().unwrap();
+        let v2: serde_json::Value = serde_json::from_str(msg2.as_str()).unwrap();
+        assert_eq!(v2["params"]["text"], "later");
     }
 
     #[test]

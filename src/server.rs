@@ -143,7 +143,15 @@ fn handle_client(stream: TcpStream, token: Arc<String>, clients: Clients) {
         // 2. Read one inbound message (or time out and loop).
         match websocket.read() {
             Ok(Message::Close(_)) => return,
-            // T06 will parse Text frames as JSON-RPC (initialize, tools/list).
+            // Parse text frames as JSON-RPC and reply if a response is due.
+            Ok(Message::Text(text)) => {
+                if let Some(response) = crate::mcp::handle_message(text.as_str()) {
+                    if websocket.send(Message::text(response)).is_err() {
+                        return;
+                    }
+                }
+            }
+            // Ping/Pong are handled by tungstenite; ignore other frame types.
             Ok(_message) => {}
             // Read timed out: no data this interval, just loop back to step 1.
             Err(tungstenite::Error::Io(e))
@@ -174,6 +182,29 @@ mod tests {
                 .insert(AUTH_HEADER, t.parse().unwrap());
         }
         tungstenite::connect(request).is_ok()
+    }
+
+    #[test]
+    fn responds_to_initialize_over_the_socket() {
+        let token = "0123456789abcdef0123456789abcdef".to_string();
+        let server = Server::start(token.clone()).expect("server should start");
+
+        let mut request = format!("ws://127.0.0.1:{}/", server.port)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(AUTH_HEADER, token.parse().unwrap());
+        let (mut ws, _resp) = tungstenite::connect(request).expect("should connect");
+
+        ws.send(Message::text(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        ))
+        .unwrap();
+
+        let reply = ws.read().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(reply.as_str()).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(v["result"]["serverInfo"]["name"], "Helix");
     }
 
     #[test]

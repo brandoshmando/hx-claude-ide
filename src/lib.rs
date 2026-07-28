@@ -18,6 +18,8 @@ use steel::steel_vm::ffi::{FFIModule, RegisterFFIFn};
 #[allow(dead_code)]
 mod lockfile;
 #[allow(dead_code)]
+mod mcp;
+#[allow(dead_code)]
 mod server;
 
 /// Steel entrypoint: `(claude-ide/start)`.

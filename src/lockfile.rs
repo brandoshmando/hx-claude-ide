@@ -112,7 +112,9 @@ mod tests {
 
     #[test]
     fn writes_lockfile_with_expected_shape() {
-        // Isolate the write under a unique temp CLAUDE_CONFIG_DIR.
+        // Serialize against other tests that mutate CLAUDE_CONFIG_DIR (they share
+        // one test binary and run concurrently), then isolate under a temp dir.
+        let _guard = crate::ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("hxcc-test-{}", std::process::id()));
         std::env::set_var("CLAUDE_CONFIG_DIR", &base);
 

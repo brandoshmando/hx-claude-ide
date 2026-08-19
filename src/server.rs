@@ -250,56 +250,11 @@ fn handle_client(stream: TcpStream, token: Arc<String>, clients: Clients) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tungstenite::client::IntoClientRequest;
 
-    /// Attempts a WS handshake to the given port with an optional auth token;
-    /// returns whether the handshake succeeded.
-    fn handshake_succeeds(port: u16, token: Option<&str>) -> bool {
-        let mut request = format!("ws://127.0.0.1:{port}/")
-            .into_client_request()
-            .unwrap();
-        if let Some(t) = token {
-            request
-                .headers_mut()
-                .insert(AUTH_HEADER, t.parse().unwrap());
-        }
-        tungstenite::connect(request).is_ok()
-    }
-
-    #[test]
-    fn responds_to_initialize_over_the_socket() {
-        let token = "0123456789abcdef0123456789abcdef".to_string();
-        let server = Server::start(token.clone()).expect("server should start");
-
-        let mut request = format!("ws://127.0.0.1:{}/", server.port)
-            .into_client_request()
-            .unwrap();
-        request.headers_mut().insert(AUTH_HEADER, token.parse().unwrap());
-        let (mut ws, _resp) = tungstenite::connect(request).expect("should connect");
-
-        ws.send(Message::text(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
-        ))
-        .unwrap();
-
-        let reply = ws.read().unwrap().into_text().unwrap();
-        let v: serde_json::Value = serde_json::from_str(reply.as_str()).unwrap();
-        assert_eq!(v["id"], 1);
-        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(v["result"]["serverInfo"]["name"], "Helix");
-    }
-
-    fn sample_payload(text: &str) -> SelectionPayload {
-        SelectionPayload {
-            file: "/tmp/example.rs".to_string(),
-            text: text.to_string(),
-            start_line: 1,
-            start_col: 0,
-            end_line: 1,
-            end_col: 4,
-            is_empty: text.is_empty(),
-        }
-    }
+    // Socket-level behavior (auth, MCP handshake, debounced broadcast) is
+    // exercised end-to-end in `tests/protocol.rs`. This unit test covers the one
+    // thing that suite can't reach: the private `selection_notification`
+    // serializer (F2 wire shape).
 
     #[test]
     fn notification_has_f2_shape() {
@@ -326,58 +281,5 @@ mod tests {
         assert_eq!(v["params"]["selection"]["end"]["line"], 12);
         assert_eq!(v["params"]["selection"]["end"]["character"], 3);
         assert_eq!(v["params"]["selection"]["isEmpty"], false);
-    }
-
-    #[test]
-    fn debounces_burst_and_broadcasts_selection_changed() {
-        let token = "0123456789abcdef0123456789abcdef";
-        let server = Server::start(token.to_string()).expect("server should start");
-
-        // Connect via a raw TcpStream so we can set a read timeout — the test
-        // fails fast instead of hanging if no notification ever arrives.
-        let addr = format!("127.0.0.1:{}", server.port);
-        let stream = std::net::TcpStream::connect(&addr).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut request = format!("ws://{addr}/").into_client_request().unwrap();
-        request.headers_mut().insert(AUTH_HEADER, token.parse().unwrap());
-        let (mut ws, _resp) = tungstenite::client(request, stream).expect("handshake");
-
-        // Ensure the server has registered this client before we push.
-        thread::sleep(Duration::from_millis(150));
-
-        // A burst of three within the debounce window collapses to one broadcast,
-        // carrying the latest payload.
-        for text in ["first", "second", "final"] {
-            server.push_selection(sample_payload(text));
-        }
-        let msg = ws.read().unwrap().into_text().unwrap();
-        let v: serde_json::Value = serde_json::from_str(msg.as_str()).unwrap();
-        assert_eq!(v["method"], "selection_changed");
-        assert_eq!(v["params"]["text"], "final", "burst should collapse to the latest");
-
-        // A separate, later update emits its own notification.
-        server.push_selection(sample_payload("later"));
-        let msg2 = ws.read().unwrap().into_text().unwrap();
-        let v2: serde_json::Value = serde_json::from_str(msg2.as_str()).unwrap();
-        assert_eq!(v2["params"]["text"], "later");
-    }
-
-    #[test]
-    fn accepts_valid_token_and_rejects_others() {
-        let token = "0123456789abcdef0123456789abcdef".to_string();
-        let server = Server::start(token.clone()).expect("server should start");
-
-        assert!(
-            handshake_succeeds(server.port, Some(&token)),
-            "correct token should be accepted"
-        );
-        assert!(
-            !handshake_succeeds(server.port, Some("wrong-token")),
-            "incorrect token should be rejected"
-        );
-        assert!(
-            !handshake_succeeds(server.port, None),
-            "missing token should be rejected"
-        );
     }
 }

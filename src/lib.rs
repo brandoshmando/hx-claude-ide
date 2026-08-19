@@ -21,7 +21,9 @@ use steel::steel_vm::ffi::{FFIModule, RegisterFFIFn};
 
 mod lockfile;
 mod mcp;
-mod server;
+// Public so the `tests/protocol.rs` integration suite can drive the server
+// (`Server`, `SelectionPayload`) as an external consumer would.
+pub mod server;
 
 use lockfile::LockFile;
 use server::{SelectionPayload, Server};

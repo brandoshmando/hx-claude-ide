@@ -9,7 +9,10 @@ publish = false
 name = "claude_ide"
 # cdylib = a C-ABI dynamic library (.dylib/.so/.dll). This is what Steel's forge
 # loads at runtime; the file it produces is `libclaude_ide.<ext>`.
-crate-type = ["cdylib"]
+# rlib is added so the `tests/protocol.rs` integration suite can link the crate
+# as a normal Rust library (a cdylib alone can't be linked by a test binary).
+# It does not affect the shipped dylib.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Pinned to the exact steel rev Helix (hx-steel) is built from, so our dylib is

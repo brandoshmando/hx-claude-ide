@@ -18,7 +18,13 @@ crate-type = ["cdylib", "rlib"]
 # Pinned to the exact steel rev Helix (hx-steel) is built from, so our dylib is
 # ABI-compatible with the host. The crate is `steel-core` but its lib is named
 # `steel`, so in code we write `use steel::...`.
-steel-core = { git = "https://github.com/mattwparas/steel.git", rev = "3a418c9", features = ["dylibs"] }
+#
+# The feature set MUST match the host's exactly — features like `sync`, `biased`,
+# and `imbl` change the in-memory layout of `SteelVal`/FFI types, and a mismatch
+# surfaces at load time as an `abi_stable` "incompatible type size" panic. This
+# list mirrors helix's workspace `Cargo.toml` (`[workspace.dependencies]
+# steel-core`); re-check it whenever the host is rebuilt from a new revision.
+steel-core = { git = "https://github.com/mattwparas/steel.git", rev = "3a418c9", features = ["anyhow", "dylibs", "sync", "biased", "imbl"] }
 # Provides the stable-ABI plumbing the `declare_module!` macro relies on.
 abi_stable = "0.11.1"
 # Cross-platform access to the OS cryptographic RNG (for the auth token).
@@ -26,3 +32,5 @@ getrandom = "0.2"
 # Builds the lock file / protocol JSON via the `json!` macro.
 serde_json = "1"
 tungstenite = "0.30.0"
+# For `kill(pid, 0)` liveness checks when sweeping stale lockfiles on startup.
+libc = "0.2"

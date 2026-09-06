@@ -64,6 +64,11 @@ fn start() {
         return; // already running
     }
 
+    // Reap lockfiles from prior Helix sessions that exited without cleanup — our
+    // `Drop` can't run at process exit (the owner is a `static`), so this is the
+    // only reliable moment to clear the corpses. Best-effort.
+    lockfile::sweep_stale();
+
     // The workspace folder Claude matches `/ide` against is this process's cwd
     // (i.e. Helix's cwd, decision D4). Without it there's nothing to advertise.
     let workspace = std::env::current_dir()

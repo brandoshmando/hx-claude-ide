@@ -92,8 +92,61 @@ impl LockFile {
 impl Drop for LockFile {
     fn drop(&mut self) {
         // Best-effort: ignore errors (the file may already be gone).
+        //
+        // NOTE: in the plugin this rarely runs. The `LockFile` is owned by a
+        // `static` (see `lib.rs`), and Rust does not drop statics at process
+        // exit — and Helix exposes no editor-quit hook to call `stop()`. So a
+        // normal `hx-steel` quit leaves the lockfile behind; `sweep_stale()`
+        // (run on the next `start()`) is what actually reaps it.
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Reap stale lockfiles left by prior Helix sessions that exited without
+/// cleanup. Scans the ide dir and deletes any `*.lock` whose `ideName` is
+/// "Helix" and whose recorded `pid` is no longer alive. Best-effort — errors
+/// are ignored — and it never touches other editors' lockfiles (e.g. VS Code).
+pub fn sweep_stale() {
+    let dir = ide_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return, // dir missing/unreadable → nothing to sweep
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lock") {
+            continue;
+        }
+        let json: serde_json::Value = match fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(v) => v,
+            None => continue, // unreadable / not JSON → leave it alone
+        };
+        // Only reap our own editor's locks; leave VS Code / others untouched.
+        if json.get("ideName").and_then(|v| v.as_str()) != Some("Helix") {
+            continue;
+        }
+        let pid = match json.get("pid").and_then(|v| v.as_i64()) {
+            Some(pid) => pid as i32,
+            None => continue,
+        };
+        if !pid_alive(pid) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Whether a process with `pid` currently exists. `kill(pid, 0)` sends no
+/// signal but still performs the existence/permission check: `0` (or `EPERM`,
+/// meaning it exists but we may not signal it) → alive; `ESRCH` → gone.
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 has no side effects; this is purely the liveness probe.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(test)]
@@ -141,6 +194,41 @@ mod tests {
         // Drop removes the file.
         drop(lock);
         assert!(!path.exists(), "drop should remove the lock file");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sweep_removes_dead_helix_locks_only() {
+        let _guard = crate::ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("hxcc-sweep-{}", std::process::id()));
+        std::env::set_var("CLAUDE_CONFIG_DIR", &base);
+        let dir = base.join("ide");
+        fs::create_dir_all(&dir).unwrap();
+
+        // 999999 is above the OS max pid → guaranteed not alive.
+        fs::write(dir.join("1111.lock"), r#"{"ideName":"Helix","pid":999999}"#).unwrap();
+        // Our own pid is alive → must be kept.
+        let mine = std::process::id();
+        fs::write(
+            dir.join("2222.lock"),
+            format!(r#"{{"ideName":"Helix","pid":{mine}}}"#),
+        )
+        .unwrap();
+        // A different editor with a dead pid → must NOT be touched.
+        fs::write(
+            dir.join("3333.lock"),
+            r#"{"ideName":"Visual Studio Code","pid":999999}"#,
+        )
+        .unwrap();
+
+        sweep_stale();
+
+        assert!(!dir.join("1111.lock").exists(), "dead Helix lock should be swept");
+        assert!(dir.join("2222.lock").exists(), "live Helix lock should remain");
+        assert!(
+            dir.join("3333.lock").exists(),
+            "other editors' lockfiles must be left alone"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

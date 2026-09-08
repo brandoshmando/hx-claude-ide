@@ -16,27 +16,37 @@ use std::path::PathBuf;
 ///
 /// 16 random bytes × 2 hex digits each = 32 chars. Claude compares this against
 /// the `x-claude-code-ide-authorization` header on the WebSocket upgrade.
-pub fn generate_token() -> String {
+pub fn generate_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
-    // Fills `bytes` from the OS CSPRNG. Failure here means the OS has no
-    // randomness source, which is effectively impossible on a real host.
-    getrandom::getrandom(&mut bytes).expect("OS randomness unavailable");
+    // Fills `bytes` from the OS CSPRNG. Failure means the OS has no randomness
+    // source — effectively impossible on a real host, but we return the error
+    // rather than panic: this runs on the FFI thread, where a panic is UB.
+    getrandom::getrandom(&mut bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("OS randomness unavailable: {e}"),
+        )
+    })?;
     // `{:02x}` = hex, zero-padded to 2 digits. Collect the per-byte strings
     // into one String.
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The directory that holds lock files: `$CLAUDE_CONFIG_DIR/ide` when that env
 /// var is set (Claude honors it to relocate its config), else `$HOME/.claude/ide`.
-fn ide_dir() -> PathBuf {
+fn ide_dir() -> std::io::Result<PathBuf> {
     let base = match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) => PathBuf::from(dir),
         None => {
-            let home = std::env::var_os("HOME").expect("HOME not set");
+            // Return an error rather than `.expect()` — callers run on the FFI
+            // thread and must not panic.
+            let home = std::env::var_os("HOME").ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set")
+            })?;
             PathBuf::from(home).join(".claude")
         }
     };
-    base.join("ide")
+    Ok(base.join("ide"))
 }
 
 /// An on-disk lock file. Dropping it best-effort removes the file, so a clean
@@ -54,7 +64,7 @@ impl LockFile {
     /// temp file and `rename` it into place so a reader never sees a partial
     /// file (rename is atomic on the same filesystem).
     pub fn write(port: u16, workspace: &str, token: &str) -> std::io::Result<LockFile> {
-        let dir = ide_dir();
+        let dir = ide_dir()?;
         fs::DirBuilder::new()
             .recursive(true) // create parents as needed; ok if it already exists
             .mode(0o700) // applied to directories this call creates
@@ -107,7 +117,10 @@ impl Drop for LockFile {
 /// "Helix" and whose recorded `pid` is no longer alive. Best-effort — errors
 /// are ignored — and it never touches other editors' lockfiles (e.g. VS Code).
 pub fn sweep_stale() {
-    let dir = ide_dir();
+    let dir = match ide_dir() {
+        Ok(dir) => dir,
+        Err(_) => return, // no HOME/config dir → nothing to sweep
+    };
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(_) => return, // dir missing/unreadable → nothing to sweep
@@ -156,11 +169,11 @@ mod tests {
 
     #[test]
     fn token_is_32_lowercase_hex() {
-        let t = generate_token();
+        let t = generate_token().unwrap();
         assert_eq!(t.len(), 32);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // Two separate tokens should not collide.
-        assert_ne!(t, generate_token());
+        assert_ne!(t, generate_token().unwrap());
     }
 
     #[test]
@@ -171,7 +184,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("hxcc-test-{}", std::process::id()));
         std::env::set_var("CLAUDE_CONFIG_DIR", &base);
 
-        let token = generate_token();
+        let token = generate_token().unwrap();
         let lock = LockFile::write(12345, "/tmp/project", &token).expect("write lock");
 
         let path = base.join("ide").join("12345.lock");

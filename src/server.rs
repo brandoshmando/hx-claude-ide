@@ -132,7 +132,9 @@ fn emitter_loop(rx: Receiver<SelectionPayload>, clients: Clients) {
 
 /// Sends `message` to every client, dropping any whose receiver has hung up.
 fn broadcast(clients: &Clients, message: Message) {
-    let mut guard = clients.lock().unwrap();
+    // Poison-tolerant: if a connection thread panicked mid-lock, we still want
+    // broadcasts to keep working rather than cascade-panic every future call.
+    let mut guard = clients.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // `retain` keeps only the entries whose closure returns true. A failed
     // `send` means that client's connection thread is gone → prune it.
     guard.retain(|tx| tx.send(message.clone()).is_ok());
@@ -168,7 +170,12 @@ fn accept_loop(listener: TcpListener, token: Arc<String>, clients: Clients) {
         // Each connection thread needs its own handle to the shared state.
         let token = Arc::clone(&token);
         let clients = Arc::clone(&clients);
-        thread::spawn(move || handle_client(stream, token, clients));
+        // Isolate each connection: a panic here must not escape the thread (and,
+        // via a poisoned lock, take down the others). Matches the emitter/accept
+        // threads' panic containment.
+        thread::spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| handle_client(stream, token, clients)));
+        });
     }
 }
 
@@ -205,7 +212,10 @@ fn handle_client(stream: TcpStream, token: Arc<String>, clients: Clients) {
     // Register this client so the emitter can push to it. `tx`/`rx` are the two
     // ends of a queue: the emitter holds clones of `tx`; we own the `rx`.
     let (tx, rx): (Sender<Message>, Receiver<Message>) = mpsc::channel();
-    clients.lock().unwrap().push(tx);
+    clients
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(tx);
 
     // A read timeout turns the otherwise-blocking `read()` into a poll: it
     // returns a WouldBlock/TimedOut error every POLL_INTERVAL, giving us a chance

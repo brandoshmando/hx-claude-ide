@@ -7,11 +7,15 @@
 //! - `claude-ide/push-selection` — forward the current editor selection to Claude Code
 //! - `claude-ide/stop`           — tear the server down and remove the lockfile
 //!
-//! All three are best-effort and MUST NOT panic across the FFI boundary — a panic
-//! unwinding into the Steel VM is undefined behavior. Each entrypoint therefore
-//! swallows its errors (there is nothing useful to report back to the editor),
-//! and the server's own threads are additionally panic-isolated (see `server`).
+//! None of the three may panic across the FFI boundary — a panic unwinding into
+//! the Steel VM is undefined behavior. Each entrypoint is therefore wrapped in
+//! `catch_unwind` as a hard backstop, and the `APP` lock is read
+//! poison-tolerantly so one stray panic can't silently kill the plugin for the
+//! rest of the session. `start` reports real failures by returning
+//! `Result<(), String>` (Steel raises the `Err` as a visible, non-fatal error);
+//! `push_selection` stays quiet by design (it fires on every cursor move).
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 // `FFIModule` is the table of functions we expose to Steel.
@@ -52,16 +56,22 @@ pub(crate) static ENV_GUARD: Mutex<()> = Mutex::new(());
 /// Steel entrypoint: `(claude-ide/start)`.
 ///
 /// Binds a loopback WebSocket port, writes `~/.claude/ide/<port>.lock`, and
-/// spawns the server thread. Idempotent: if the server is already running (or the
-/// lock is poisoned) this is a no-op. Any bind/IO failure is swallowed — the
-/// plugin simply stays inactive rather than taking Helix down with it.
-fn start() {
-    let mut app = match APP.lock() {
-        Ok(app) => app,
-        Err(_) => return, // a prior panic poisoned the lock; stay inactive
-    };
+/// spawns the server thread. Idempotent — an already-running (or already-started)
+/// instance returns `Ok(())`. Real failures come back as `Err(msg)`, which Steel
+/// raises as a visible, non-fatal error. `catch_unwind` guarantees a panic can
+/// never reach the Steel VM.
+fn start() -> Result<(), String> {
+    match catch_unwind(AssertUnwindSafe(start_inner)) {
+        Ok(result) => result,
+        Err(_) => Err("claude-ide: internal panic during start (contained)".to_string()),
+    }
+}
+
+fn start_inner() -> Result<(), String> {
+    // Poison-tolerant: a prior panic elsewhere shouldn't permanently disable us.
+    let mut app = APP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if app.is_some() {
-        return; // already running
+        return Ok(()); // already running — idempotent success
     }
 
     // Reap lockfiles from prior Helix sessions that exited without cleanup — our
@@ -72,29 +82,24 @@ fn start() {
     // The workspace folder Claude matches `/ide` against is this process's cwd
     // (i.e. Helix's cwd, decision D4). Without it there's nothing to advertise.
     let workspace = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.into_os_string().into_string().ok());
-    let workspace = match workspace {
-        Some(w) => w,
-        None => return,
-    };
+        .map_err(|e| format!("cannot determine workspace directory (cwd): {e}"))?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "workspace path is not valid UTF-8".to_string())?;
 
-    let token = lockfile::generate_token();
-    let server = match Server::start(token.clone()) {
-        Ok(server) => server,
-        Err(_) => return,
-    };
+    let token = lockfile::generate_token().map_err(|e| format!("token generation failed: {e}"))?;
     // `server.port` is the OS-assigned port the listener bound to — it names the
     // lockfile and is what Claude connects back to.
-    let lock = match LockFile::write(server.port, &workspace, &token) {
-        Ok(lock) => lock,
-        Err(_) => return, // server threads idle unreferenced; harmless for MVP
-    };
+    let server = Server::start(token.clone())
+        .map_err(|e| format!("failed to bind WebSocket server: {e}"))?;
+    let lock = LockFile::write(server.port, &workspace, &token)
+        .map_err(|e| format!("failed to write lockfile: {e}"))?;
 
     *app = Some(App {
         server,
         _lock: lock,
     });
+    Ok(())
 }
 
 /// Steel entrypoint: `(claude-ide/push-selection file text sl sc el ec is-empty)`.
@@ -113,21 +118,23 @@ fn push_selection(
     end_col: isize,
     is_empty: bool,
 ) {
-    let app = match APP.lock() {
-        Ok(app) => app,
-        Err(_) => return,
-    };
-    if let Some(app) = app.as_ref() {
-        app.server.push_selection(SelectionPayload {
-            file,
-            text,
-            start_line: start_line as i64,
-            start_col: start_col as i64,
-            end_line: end_line as i64,
-            end_col: end_col as i64,
-            is_empty,
-        });
-    }
+    // Fires on every cursor move, so failures stay quiet (a dropped update is
+    // harmless — the next one supersedes it). The `catch_unwind` is the only
+    // non-negotiable: a panic here would unwind into the Steel VM.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let app = APP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(app) = app.as_ref() {
+            app.server.push_selection(SelectionPayload {
+                file,
+                text,
+                start_line: start_line as i64,
+                start_col: start_col as i64,
+                end_line: end_line as i64,
+                end_col: end_col as i64,
+                is_empty,
+            });
+        }
+    }));
 }
 
 /// Steel entrypoint: `(claude-ide/stop)`.
@@ -137,9 +144,10 @@ fn push_selection(
 /// blocking accept thread lingers on its bound port until the process exits — a
 /// known MVP limitation, harmless because nothing advertises that port anymore.
 fn stop() {
-    if let Ok(mut app) = APP.lock() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut app = APP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *app = None;
-    }
+    }));
 }
 
 /// Builds the module Steel loads. The name string is the module path the Steel
@@ -178,8 +186,8 @@ mod tests {
         let base = std::env::temp_dir().join(format!("hxcc-lib-{}", std::process::id()));
         std::env::set_var("CLAUDE_CONFIG_DIR", &base);
 
-        start();
-        start(); // second call must be a no-op (idempotent)
+        start().expect("start should succeed");
+        start().expect("second start is an idempotent no-op"); // must not error
         let port = running_port().expect("server should be running after start()");
 
         // The lockfile Claude would read: <base>/ide/<port>.lock.

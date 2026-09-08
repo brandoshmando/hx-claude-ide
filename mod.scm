@@ -13,10 +13,11 @@
 ;; --- Helix bindings we call --------------------------------------------------
 ;; register-hook, editor-focus, editor->doc-id, editor->text  (helix/core/editor)
 (require "helix/editor.scm")
-;; cx->current-file, current-selection-object, current-selection->string,
-;; selection->primary-range, range->from, range->to           (helix/core/static)
+;; cx->current-file, current-selection-object, selection->primary-range,
+;; range->from, range->to                                      (helix/core/static)
 (require "helix/static.scm")
-;; rope-char->line, rope-line->char — 0-indexed, arg order (rope offset).
+;; rope-char->line, rope-line->char (0-indexed, arg order (rope offset)), plus
+;; rope->slice / rope->string for extracting the selected text.  (helix/core/text)
 (require-builtin helix/core/text)
 
 ;; --- Our native dylib --------------------------------------------------------
@@ -47,7 +48,10 @@
   ;; width>1 rule (D6): a single-grapheme range is a Normal-mode cursor, which we
   ;; treat as "no selection" rather than a 1-char selection.
   (define is-empty (<= (- to from) 1))
-  (define text (if is-empty "" (current-selection->string)))
+  ;; Slice the selected text out of the rope ourselves over [from, to). Do NOT
+  ;; use `current-selection->string` — despite the name it returns only the
+  ;; single grapheme under the cursor (Helix `get_selection`), not the selection.
+  (define text (if is-empty "" (rope->string (rope->slice rope from to))))
   ;; char offset -> (line, column). rope-line->char gives the line's first char
   ;; offset; subtracting yields the 0-indexed column.
   (define sl (rope-char->line rope from))

@@ -23,9 +23,29 @@ around the editor.
 
 ## Install
 
-### From source
+### With forge (recommended)
 
-Build and install the dylib directly:
+`forge`, the Steel package manager, installs straight from git — no manual clone:
+
+```sh
+forge pkg install --git https://github.com/brandoshmando/hx-claude-ide.git
+# pin a commit with:   --rev <sha>
+# refresh after an update:   add --force
+```
+
+This builds `libclaude_ide.dylib` into `$STEEL_HOME/native/` and installs the
+`mod.scm` module under `$STEEL_HOME` (as `claude-ide/`, its cog `package-name`;
+`forge list` shows what's installed). Then load it from `~/.config/helix/init.scm`:
+
+```scheme
+(require "claude-ide/mod.scm")
+(claude-ide/start)
+```
+
+### From source (development)
+
+To hack on the plugin, build the dylib directly and require the module from your
+checkout so edits take effect on the next `hx-steel` restart:
 
 ```sh
 git clone https://github.com/brandoshmando/hx-claude-ide.git
@@ -33,30 +53,8 @@ cd hx-claude-ide
 cargo steel-lib   # builds + copies libclaude_ide.dylib into $STEEL_HOME/native/
 ```
 
-Then require it by absolute path in `~/.config/helix/init.scm`:
-
 ```scheme
 (require "/absolute/path/to/hx-claude-ide/mod.scm")
-(claude-ide/start)
-```
-
-### With forge (experimental)
-
-`forge`, the Steel package manager, can install straight from git — no manual
-clone. **This path isn't verified end-to-end yet**; if you try it, reports are
-welcome.
-
-```sh
-forge pkg install --git https://github.com/brandoshmando/hx-claude-ide.git
-# pin a commit with:  --rev <sha>
-```
-
-It should build `libclaude_ide.dylib` into `$STEEL_HOME/native/` and install the
-`mod.scm` module under `$STEEL_HOME` (as `claude-ide/`, its cog `package-name`;
-`forge list` shows what's installed). Then load it from `~/.config/helix/init.scm`:
-
-```scheme
-(require "claude-ide/mod.scm")
 (claude-ide/start)
 ```
 

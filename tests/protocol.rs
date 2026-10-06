@@ -83,6 +83,25 @@ fn accepts_valid_token_and_rejects_others() {
 }
 
 #[test]
+fn selects_mcp_subprotocol_when_offered() {
+    // Claude Code offers `Sec-WebSocket-Protocol: mcp`; a compliant client fails
+    // the handshake unless the server selects it.
+    let server = Server::start(TOKEN.to_string()).expect("server should start");
+    let mut request = format!("ws://127.0.0.1:{}/", server.port)
+        .into_client_request()
+        .unwrap();
+    let headers = request.headers_mut();
+    headers.insert(AUTH_HEADER, TOKEN.parse().unwrap());
+    headers.insert("sec-websocket-protocol", "mcp".parse().unwrap());
+
+    let (_ws, response) = tungstenite::connect(request).expect("handshake should succeed");
+    assert_eq!(
+        response.headers().get("sec-websocket-protocol").unwrap(),
+        "mcp"
+    );
+}
+
+#[test]
 fn initialize_and_tools_list_are_well_formed() {
     let server = Server::start(TOKEN.to_string()).expect("server should start");
     let mut ws = connect_authed(server.port);

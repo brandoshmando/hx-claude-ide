@@ -24,6 +24,11 @@ use tungstenite::Message;
 /// the token we wrote into the lock file.
 const AUTH_HEADER: &str = "x-claude-code-ide-authorization";
 
+/// WebSocket subprotocol Claude Code requests on the upgrade. A client that
+/// offers subprotocols must fail the connection if the server doesn't select
+/// one (RFC 6455 §4.1), so we echo it back whenever it's offered.
+const MCP_SUBPROTOCOL: &str = "mcp";
+
 /// How often the per-connection loop wakes to flush queued outgoing messages
 /// while otherwise blocked reading. A short timeout keeps latency low without a
 /// hot spin.
@@ -185,13 +190,28 @@ fn handle_client(stream: TcpStream, token: Arc<String>, clients: Clients) {
     // The handshake callback: inspect the upgrade request's headers and either
     // accept (return the response) or reject (return an error response). This
     // closure runs once, during `accept_hdr` below.
-    let authenticate = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+    let authenticate = |request: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
         let presented = request
             .headers()
             .get(AUTH_HEADER)
             .and_then(|value| value.to_str().ok());
 
         if presented == Some(token.as_str()) {
+            // Select the `mcp` subprotocol if offered. The header is a
+            // comma-separated list and may be repeated.
+            let offers_mcp = request
+                .headers()
+                .get_all(tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|list| list.split(','))
+                .any(|proto| proto.trim() == MCP_SUBPROTOCOL);
+            if offers_mcp {
+                response.headers_mut().insert(
+                    tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+                    tungstenite::http::HeaderValue::from_static(MCP_SUBPROTOCOL),
+                );
+            }
             Ok(response)
         } else {
             let deny = tungstenite::http::Response::builder()

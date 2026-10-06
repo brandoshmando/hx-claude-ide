@@ -34,9 +34,16 @@ pub fn handle_message(text: &str) -> Option<String> {
 
     let response = match method {
         "initialize" => success(id, initialize_result()),
+        // MCP liveness check: the spec requires an empty result. Answering with
+        // "method not found" makes the client treat us as unhealthy and drop
+        // the connection.
+        "ping" => success(id, json!({})),
         // Minimal MVP: advertise no tools (see module doc). Selection works via
         // the pushed `selection_changed` notification, not a tool.
         "tools/list" => success(id, json!({ "tools": [] })),
+        // We advertise the `prompts` capability (mirroring the reference), so
+        // the list call must succeed — just with nothing in it.
+        "prompts/list" => success(id, json!({ "prompts": [] })),
         // Advertised-but-unimplemented tool calls, and anything else, get a
         // standard "method not found". Keeps the connection healthy.
         other => error(id, -32601, &format!("method not found: {other}")),
@@ -94,6 +101,27 @@ mod tests {
         assert_eq!(v["id"], "abc"); // string ids echo too
         let tools = v["result"]["tools"].as_array().unwrap();
         assert!(tools.is_empty(), "MVP advertises no tools");
+    }
+
+    #[test]
+    fn ping_returns_empty_result() {
+        let reply = handle_message(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
+            .expect("ping should get a reply");
+        let v: Value = serde_json::from_str(&reply).unwrap();
+
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["result"], json!({}));
+        assert!(v.get("error").is_none(), "ping must not error");
+    }
+
+    #[test]
+    fn prompts_list_is_empty() {
+        let reply = handle_message(r#"{"jsonrpc":"2.0","id":6,"method":"prompts/list"}"#)
+            .expect("prompts/list should get a reply");
+        let v: Value = serde_json::from_str(&reply).unwrap();
+
+        assert_eq!(v["id"], 6);
+        assert!(v["result"]["prompts"].as_array().unwrap().is_empty());
     }
 
     #[test]
